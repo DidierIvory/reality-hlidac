@@ -2,7 +2,7 @@ import os
 import json
 import smtplib
 import requests
-import xml.etree.ElementTree as ET
+import re
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from datetime import datetime
@@ -17,10 +17,13 @@ SOUBOR_VIDENYCH = "videne_inzeraty.json"
 
 HEADERS = {
     "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "Mozilla/5.0 (X11; Linux x86_64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/122.0.0.0 Safari/537.36"
-    )
+        "Chrome/123.0.0.0 Safari/537.36"
+    ),
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "cs-CZ,cs;q=0.9",
+    "Referer": "https://www.sreality.cz/",
 }
 
 def nacti_videne():
@@ -34,127 +37,124 @@ def uloz_videne(videne):
         json.dump(list(videne), f)
 
 # ------------------------------------------------------------
-# SREALITY.CZ – RSS feed (spolehlivější než JSON API)
+# SREALITY.CZ – JSON API
 # category_main_cb: 2=Domy, 3=Pozemky
 # category_type_cb: 1=Prodej
+# locality_district_id: 5103=Benešov
 # ------------------------------------------------------------
 def hledej_sreality():
     nalezeno = []
-    feeds = [
-        {
-            "url": (
-                "https://www.sreality.cz/api/cs/v2/estates/rss"
-                "?category_main_cb=3"        # Pozemky
-                "&category_type_cb=1"         # Prodej
-                "&locality_district_id=5103"  # okres Benešov
-                "&locality_radius=10"
-                "&price_min=1000000"
-                "&price_max=5800000"
-            ),
-            "label": "Pozemek"
-        },
-        {
-            "url": (
-                "https://www.sreality.cz/api/cs/v2/estates/rss"
-                "?category_main_cb=2"        # Domy
-                "&category_type_cb=1"         # Prodej
-                "&locality_district_id=5103"  # okres Benešov
-                "&locality_radius=10"
-                "&price_min=1000000"
-                "&price_max=5800000"
-            ),
-            "label": "Dům"
-        },
+    dotazy = [
+        {"category_main_cb": 3, "label": "Pozemek"},
+        {"category_main_cb": 2, "label": "Dům"},
     ]
-    for feed in feeds:
+    session = requests.Session()
+    # Nejdřív načteme hlavní stránku aby jsme dostali cookies
+    try:
+        session.get("https://www.sreality.cz/", headers={
+            "User-Agent": HEADERS["User-Agent"],
+            "Accept": "text/html",
+        }, timeout=10)
+    except:
+        pass
+
+    for dotaz in dotazy:
+        url = (
+            "https://www.sreality.cz/api/cs/v2/estates"
+            f"?category_main_cb={dotaz['category_main_cb']}"
+            "&category_type_cb=1"
+            "&locality_district_id=5103"
+            "&locality_radius=10"
+            "&price_min=1000000"
+            "&price_max=5800000"
+            "&per_page=60"
+            "&sort=0"
+        )
         try:
-            r = requests.get(feed["url"], headers=HEADERS, timeout=15)
-            print(f"[Sreality {feed['label']}] HTTP {r.status_code}")
-            root = ET.fromstring(r.content)
-            items = root.findall(".//item")
-            print(f"[Sreality {feed['label']}] Nalezeno položek: {len(items)}")
-            for item in items:
-                link = item.findtext("link", "").strip()
-                title = item.findtext("title", "Bez názvu").strip()
-                guid = item.findtext("guid", link).strip()
-                eid = guid.split("/")[-1] if guid else link
-
-                # Cena z description
-                desc = item.findtext("description", "")
-                cena_str = ""
-                if "Kč" in desc:
-                    import re
-                    match = re.search(r"([\d\s]+)\s*Kč", desc)
-                    if match:
-                        cena_str = match.group(0).strip()
-
+            r = session.get(url, headers=HEADERS, timeout=20)
+            print(f"[Sreality {dotaz['label']}] HTTP {r.status_code}, délka: {len(r.content)}")
+            if r.status_code != 200:
+                print(f"[Sreality {dotaz['label']}] Odpověď: {r.text[:200]}")
+                continue
+            data = r.json()
+            estates = data.get("_embedded", {}).get("estates", [])
+            print(f"[Sreality {dotaz['label']}] Nalezeno: {len(estates)}")
+            for e in estates:
+                eid = str(e.get("hash_id", ""))
+                nazev = e.get("name", "Bez názvu")
+                cena = e.get("price_czk", {})
+                cena_val = cena.get("value_raw", 0) if isinstance(cena, dict) else 0
+                lokalita = e.get("locality", "")
+                link = f"https://www.sreality.cz/detail/prodej/{dotaz['label'].lower()}/{eid}"
                 nalezeno.append({
                     "id": f"sreality_{eid}",
                     "zdroj": "Sreality.cz",
-                    "typ": feed["label"],
-                    "nazev": title,
-                    "cena_str": cena_str,
-                    "lokalita": "Benešov a okolí",
+                    "typ": dotaz["label"],
+                    "nazev": nazev,
+                    "cena_str": f"{cena_val:,} Kč".replace(",", " ") if cena_val else "cena neuvedena",
+                    "lokalita": lokalita,
                     "link": link,
                 })
         except Exception as ex:
-            print(f"[Sreality {feed['label']}] Chyba: {ex}")
+            print(f"[Sreality {dotaz['label']}] Chyba: {ex}")
     return nalezeno
 
 # ------------------------------------------------------------
-# BEZREALITKY.CZ – GraphQL API
+# BEZREALITKY.CZ – scraping výsledků přes jejich API
 # ------------------------------------------------------------
 def hledej_bezrealitky():
     nalezeno = []
+    # Benešov GPS souřadnice: 49.7818, 14.6868
     typy = [
-        {"estateType": "LAND",  "label": "Pozemek"},
-        {"estateType": "HOUSE", "label": "Dům"},
+        {"offerType": "prodej", "estateType": "pozemek", "label": "Pozemek"},
+        {"offerType": "prodej", "estateType": "dum",     "label": "Dům"},
     ]
     for typ in typy:
+        url = (
+            f"https://www.bezrealitky.cz/api/record/markers"
+            f"?offerType={typ['offerType']}"
+            f"&estateType={typ['estateType']}"
+            f"&priceMin=1000000&priceMax=5800000"
+            f"&lat=49.7818&lng=14.6868&radius=10"
+        )
         try:
-            url = "https://www.bezrealitky.cz/graphql/"
-            query = """
-            query SearchEstates($offerType: OfferType, $estateType: [EstateType], $priceFrom: Int, $priceTo: Int, $regionOsmIds: [String]) {
-              estateList(
-                offerType: $offerType
-                estateType: $estateType
-                priceFrom: $priceFrom
-                priceTo: $priceTo
-                regionOsmIds: $regionOsmIds
-                limit: 30
-              ) {
-                list {
-                  id
-                  uri
-                  price
-                  address
-                }
-              }
-            }
-            """
-            variables = {
-                "offerType": "PRODEJ",
-                "estateType": [typ["estateType"]],
-                "priceFrom": 1000000,
-                "priceTo": 5800000,
-                "regionOsmIds": ["R435637"]  # Benešov okres
-            }
-            r = requests.post(
-                url,
-                json={"query": query, "variables": variables},
-                headers={**HEADERS, "Content-Type": "application/json"},
-                timeout=15
-            )
+            r = requests.get(url, headers=HEADERS, timeout=15)
             print(f"[Bezrealitky {typ['label']}] HTTP {r.status_code}")
-            data = r.json()
-            items = data.get("data", {}).get("estateList", {}).get("list", [])
+            if r.status_code != 200:
+                # Zkus alternativní endpoint
+                url2 = (
+                    f"https://www.bezrealitky.cz/vyhledavani-nemovitosti"
+                    f"?offerType=prodej&estateType={typ['estateType']}"
+                    f"&priceMin=1000000&priceMax=5800000"
+                    f"&city=Ben%C4%9B%C5%A1ov&radius=10"
+                )
+                r = requests.get(url2, headers={**HEADERS, "Accept": "text/html"}, timeout=15)
+                print(f"[Bezrealitky {typ['label']}] Alt HTTP {r.status_code}")
+                # Parsuj ID z HTML
+                ids = re.findall(r'nemovitosti-byty-domy/([a-z0-9-]+)', r.text)
+                ids = list(set(ids))
+                print(f"[Bezrealitky {typ['label']}] Nalezeno ID: {len(ids)}")
+                for eid in ids[:20]:
+                    nalezeno.append({
+                        "id": f"bezrealitky_{eid}",
+                        "zdroj": "Bezrealitky.cz",
+                        "typ": typ["label"],
+                        "nazev": f"{typ['label']} – Benešov a okolí",
+                        "cena_str": "",
+                        "lokalita": "Benešov a okolí",
+                        "link": f"https://www.bezrealitky.cz/nemovitosti-byty-domy/{eid}",
+                    })
+                continue
+
+            items = r.json()
+            if not isinstance(items, list):
+                items = items.get("results", []) if isinstance(items, dict) else []
             print(f"[Bezrealitky {typ['label']}] Nalezeno: {len(items)}")
-            for item in items:
+            for item in items[:30]:
                 eid = str(item.get("id", ""))
                 cena = item.get("price", 0)
-                adresa = item.get("address", "")
-                uri = item.get("uri", "")
-                link = f"https://www.bezrealitky.cz/nemovitosti-byty-domy/{uri}" if uri else f"https://www.bezrealitky.cz"
+                adresa = item.get("address", item.get("city", ""))
+                uri = item.get("uri", eid)
                 nalezeno.append({
                     "id": f"bezrealitky_{eid}",
                     "zdroj": "Bezrealitky.cz",
@@ -162,64 +162,51 @@ def hledej_bezrealitky():
                     "nazev": f"{typ['label']} – {adresa}",
                     "cena_str": f"{cena:,} Kč".replace(",", " ") if cena else "",
                     "lokalita": adresa,
-                    "link": link,
+                    "link": f"https://www.bezrealitky.cz/nemovitosti-byty-domy/{uri}",
                 })
         except Exception as ex:
             print(f"[Bezrealitky {typ['label']}] Chyba: {ex}")
     return nalezeno
 
 # ------------------------------------------------------------
-# REALITY.CZ – RSS feed
+# REALITY.CZ – scraping HTML
 # ------------------------------------------------------------
 def hledej_reality_cz():
     nalezeno = []
-    feeds = [
+    dotazy = [
         {
-            "url": (
-                "https://www.reality.cz/rss/"
-                "?s%5Bobject%5D%5B%5D=4"          # pozemky
-                "&s%5Btype%5D=1"                   # prodej
-                "&s%5Blocality_district%5D=Bene%C5%A1ov"
-                "&s%5Bprice_from%5D=1000000"
-                "&s%5Bprice_to%5D=5800000"
-            ),
+            "url": "https://www.reality.cz/pozemky/prodej/?search[region]=Bene%C5%A1ov&search[price_from]=1000000&search[price_to]=5800000&search[radius]=10",
             "label": "Pozemek"
         },
         {
-            "url": (
-                "https://www.reality.cz/rss/"
-                "?s%5Bobject%5D%5B%5D=2"          # domy
-                "&s%5Btype%5D=1"                   # prodej
-                "&s%5Blocality_district%5D=Bene%C5%A1ov"
-                "&s%5Bprice_from%5D=1000000"
-                "&s%5Bprice_to%5D=5800000"
-            ),
+            "url": "https://www.reality.cz/rodinne-domy/prodej/?search[region]=Bene%C5%A1ov&search[price_from]=1000000&search[price_to]=5800000&search[radius]=10",
             "label": "Dům"
         },
     ]
-    for feed in feeds:
+    for dotaz in dotazy:
         try:
-            r = requests.get(feed["url"], headers=HEADERS, timeout=15)
-            print(f"[Reality.cz {feed['label']}] HTTP {r.status_code}")
-            root = ET.fromstring(r.content)
-            items = root.findall(".//item")
-            print(f"[Reality.cz {feed['label']}] Nalezeno: {len(items)}")
-            for item in items:
-                link = item.findtext("link", "").strip()
-                title = item.findtext("title", "Bez názvu").strip()
-                guid = item.findtext("guid", link).strip()
-                eid = guid.split("/")[-1] if guid else link
+            r = requests.get(dotaz["url"], headers={**HEADERS, "Accept": "text/html"}, timeout=15)
+            print(f"[Reality.cz {dotaz['label']}] HTTP {r.status_code}")
+            # Hledej ID inzerátů v HTML
+            ids = re.findall(r'/nemovitost/(\d+)', r.text)
+            ids = list(set(ids))
+            print(f"[Reality.cz {dotaz['label']}] Nalezeno ID: {len(ids)}")
+            # Hledej názvy
+            nazvy = re.findall(r'<h2[^>]*class="[^"]*title[^"]*"[^>]*>(.*?)</h2>', r.text, re.DOTALL)
+            nazvy = [re.sub(r'<[^>]+>', '', n).strip() for n in nazvy]
+            for i, eid in enumerate(ids[:20]):
+                nazev = nazvy[i] if i < len(nazvy) else f"{dotaz['label']} – Benešov a okolí"
                 nalezeno.append({
                     "id": f"reality_{eid}",
                     "zdroj": "Reality.cz",
-                    "typ": feed["label"],
-                    "nazev": title,
+                    "typ": dotaz["label"],
+                    "nazev": nazev,
                     "cena_str": "",
                     "lokalita": "Benešov a okolí",
-                    "link": link,
+                    "link": f"https://www.reality.cz/nemovitost/{eid}/",
                 })
         except Exception as ex:
-            print(f"[Reality.cz {feed['label']}] Chyba: {ex}")
+            print(f"[Reality.cz {dotaz['label']}] Chyba: {ex}")
     return nalezeno
 
 # ------------------------------------------------------------
@@ -246,6 +233,11 @@ def posli_email(nove_inzeraty):
     <html><body style='font-family:Arial,sans-serif;max-width:900px'>
     <h2 style='color:#333'>🏡 Nové nemovitosti – Benešov a okolí</h2>
     <p>Nalezeno <b>{len(nove_inzeraty)}</b> nových inzerátů odpovídajících tvým kritériím:</p>
+    <ul style='color:#555;font-size:13px'>
+      <li>Typ: Pozemky a Domy k prodeji</li>
+      <li>Lokalita: Benešov a okolí 10 km</li>
+      <li>Cena: 1 000 000 – 5 800 000 Kč</li>
+    </ul>
     <table style='border-collapse:collapse;font-size:14px;width:100%'>
       <thead>
         <tr style='background:#f5f5f5;text-align:left'>
